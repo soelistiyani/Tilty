@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+build/
+dist/
+*.spec
+.venv/
+venv/
+.idea/
+.vscode/
+output/*
+!output/Tilty-Setup.exe
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

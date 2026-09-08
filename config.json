@@ -1,0 +1,17 @@
+{
+  "refresh_seconds": 2,
+  "sensors": [
+    {
+      "key": "A",
+      "station": "Nurabelen",
+      "host": "192.189.77.45",
+      "port": 4001
+    },
+    {
+      "key": "B",
+      "station": "Wolorona",
+      "host": "192.189.77.46",
+      "port": 4001
+    }
+  ]
+}
