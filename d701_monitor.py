@@ -10,6 +10,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from collections import deque
 from contextlib import closing
@@ -52,6 +53,38 @@ class Reading:
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+
+def windows_timezone_name():
+    """Return the Windows timezone key when available, without extra dependencies."""
+    if os.name != "nt":
+        return time.tzname[0] if time.tzname else "Unknown"
+    try:
+        import winreg
+        path = r"SYSTEM\CurrentControlSet\Control\TimeZoneInformation"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            return winreg.QueryValueEx(key, "TimeZoneKeyName")[0]
+    except (OSError, ImportError):
+        return time.tzname[0] if time.tzname else "Unknown"
+
+
+def pc_time_setting(observed_at=None):
+    observed_utc = (observed_at or utc_now()).astimezone(timezone.utc)
+    local = observed_utc.astimezone()
+    offset = local.utcoffset() or timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    dst = local.dst() or timedelta(0)
+    return {
+        "observed_at_utc": iso_utc(observed_utc),
+        "local_date": local.strftime("%Y-%m-%d"),
+        "local_time": local.isoformat(timespec="seconds"),
+        "windows_timezone": windows_timezone_name(),
+        "timezone_name": local.tzname() or "Unknown",
+        "utc_offset": f"UTC{sign}{hours:02d}:{minutes:02d}",
+        "dst_active": "yes" if dst != timedelta(0) else "no",
+    }
 
 
 def iso_utc(value):
@@ -119,7 +152,7 @@ class DataWriter:
         name = safe_station_name(reading.station)
         folder = self.root / name / "minute" / reading.timestamp.strftime("%Y")
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{reading.timestamp:%Y-%m}_{name}.csv"
+        path = folder / f"{reading.timestamp:%Y-%m-%d}_{name}.csv"
         fresh = not path.exists()
         with self.lock, path.open("a", encoding="utf-8-sig", newline="") as handle:
             out = csv.writer(handle)
@@ -178,6 +211,38 @@ def query_history(data_dir, station_id, since, max_points=1500):
             ORDER BY timestamp_utc""", (station_id, iso_utc(since))).fetchall()
     parsed = [(datetime.fromisoformat(row[0].replace("Z", "+00:00")), row[1], row[2], row[3]) for row in rows]
     return downsample_rows(parsed, max_points)
+
+
+class TimeSettingsRecorder:
+    FIELDS = ("observed_at_utc", "local_date", "local_time", "windows_timezone",
+              "timezone_name", "utc_offset", "dst_active")
+    SIGNATURE_FIELDS = ("windows_timezone", "timezone_name", "utc_offset", "dst_active")
+
+    def __init__(self, data_dir):
+        self.path = Path(data_dir) / "pc_time_settings.csv"
+
+    def record_if_needed(self, setting=None):
+        setting = setting or pc_time_setting()
+        last = None
+        if self.path.exists():
+            try:
+                with self.path.open("r", encoding="utf-8-sig", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        last = row
+            except (OSError, csv.Error):
+                last = None
+        same_day = last and last.get("local_date") == setting["local_date"]
+        same_setting = last and all(last.get(key) == setting[key] for key in self.SIGNATURE_FIELDS)
+        if same_day and same_setting:
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = not self.path.exists() or self.path.stat().st_size == 0
+        with self.path.open("a", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.FIELDS)
+            if fresh:
+                writer.writeheader()
+            writer.writerow({key: setting[key] for key in self.FIELDS})
+        return True
 
 
 # Compatibility name used by older integrations/tests.
@@ -346,10 +411,11 @@ class MonitorApp(tk.Tk):
         try: self.iconbitmap(default=str(resource_path("tilty.ico")))
         except tk.TclError: pass
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.events, self.stop_event, self.workers = queue.Queue(), threading.Event(), []
+        self.events, self.workers = queue.Queue(), {}
         self.config_data = self.load_config(); self.status = {}; self.latest = {}; self.counts = {}; self.history = {}
         self.historical = {}; self.history_request = 0
         self.build_ui(); self.refresh_table(); self.after(100, self.process_events); self.after(1000, self.refresh_plot)
+        self.after(1200, self.check_time_setting)
 
     @staticmethod
     def load_config():
@@ -369,7 +435,9 @@ class MonitorApp(tk.Tk):
         settings.add_command(label="Keluar", command=self.on_close)
         menu.add_cascade(label="Pengaturan", menu=settings)
         menu.add_command(label="Kalibrasi", command=self.calibrate)
-        menu.add_command(label="Tentang", command=lambda: messagebox.showinfo("Tentang", "Tilty\nTiltmeter TCP Monitor\nOutput tilt: mikroradian (µrad)"))
+        menu.add_command(label="Tentang", command=lambda: messagebox.showinfo(
+            "Tentang Tilty", "Tilty: Tiltmeter TCP Monitor\nOutput tilt: microradian.\n\n"
+            "Didesain dan dikembangkan oleh Sulistiyani\nsoelistiyani@gmail.com"))
         self.configure(menu=menu)
         header = ttk.Frame(self, padding=(12, 8)); header.pack(fill="x")
         try:
@@ -390,8 +458,10 @@ class MonitorApp(tk.Tk):
         buttons = ttk.Frame(panel); buttons.pack(fill="x", pady=(8, 0))
         for label, cmd in (("Tambah", self.add_station), ("Edit", self.edit_station), ("Hapus", self.delete_station), ("Kalibrasi", self.calibrate)):
             ttk.Button(buttons, text=label, command=cmd).pack(side="left", padx=(0, 6))
-        self.start_button = ttk.Button(buttons, text="Mulai semua", command=self.start); self.start_button.pack(side="left", padx=(18, 6))
-        self.stop_button = ttk.Button(buttons, text="Hentikan", command=self.stop, state="disabled"); self.stop_button.pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Mulai dipilih", command=self.start_selected).pack(side="left", padx=(18, 6))
+        ttk.Button(buttons, text="Hentikan dipilih", command=self.stop_selected).pack(side="left", padx=(0, 6))
+        self.start_button = ttk.Button(buttons, text="Mulai semua", command=self.start); self.start_button.pack(side="left", padx=(8, 6))
+        self.stop_button = ttk.Button(buttons, text="Hentikan semua", command=self.stop, state="disabled"); self.stop_button.pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Buka folder data", command=self.open_folder).pack(side="left")
         self.folder_text = tk.StringVar(value=self.config_data["data_dir"]); ttk.Label(panel, textvariable=self.folder_text).pack(fill="x", pady=(7, 0))
         graph_controls = ttk.Frame(self); graph_controls.pack(fill="x", padx=10, pady=(0, 4))
@@ -455,26 +525,70 @@ class MonitorApp(tk.Tk):
         path = filedialog.askdirectory(initialdir=self.config_data["data_dir"])
         if path: self.config_data["data_dir"] = path; self.folder_text.set(path); self.save_config()
 
+    def check_time_setting(self):
+        try:
+            TimeSettingsRecorder(self.config_data["data_dir"]).record_if_needed()
+        except OSError as exc:
+            self.graph_status.set(f"Gagal mencatat setting waktu PC: {exc}")
+        self.after(60_000, self.check_time_setting)
+
     def start(self):
         try:
-            sensors = [s for s in self.config_data["sensors"] if s.get("enabled", True)]
+            sensors = [s for s in self.config_data["sensors"] if s.get("enabled", True) and s["id"] not in self.workers]
             if not sensors: raise ValueError("Tidak ada stasiun aktif")
-            endpoints = [(s["host"].lower(), int(s["port"])) for s in sensors]
-            names = [safe_station_name(s["station"]).lower() for s in sensors]
+            all_running = [entry[0].sensor for entry in self.workers.values()] + sensors
+            endpoints = [(s["host"].lower(), int(s["port"])) for s in all_running]
+            names = [safe_station_name(s["station"]).lower() for s in all_running]
             if len(endpoints) != len(set(endpoints)): raise ValueError("Endpoint aktif harus berbeda")
             if len(names) != len(set(names)): raise ValueError("Nama stasiun aktif harus berbeda")
             data_dir = Path(self.config_data["data_dir"]); data_dir.mkdir(parents=True, exist_ok=True)
         except (ValueError, OSError) as exc: messagebox.showerror("Tidak dapat memulai", str(exc)); return
-        self.save_config(); self.stop_event = threading.Event()
-        self.workers = [SensorWorker(s, data_dir, self.events, self.stop_event) for s in sensors]
-        for worker in self.workers: worker.start()
-        self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal")
+        self.save_config()
+        for sensor in sensors:
+            stop_event = threading.Event()
+            worker = SensorWorker(sensor, data_dir, self.events, stop_event)
+            self.workers[sensor["id"]] = (worker, stop_event)
+            worker.start()
+        self.stop_button.configure(state="normal")
+
+    def start_selected(self):
+        sensor = self.selected()
+        if not sensor:
+            messagebox.showinfo("Mulai stasiun", "Pilih satu stasiun terlebih dahulu."); return
+        if not sensor.get("enabled", True):
+            messagebox.showwarning("Stasiun nonaktif", "Aktifkan stasiun melalui tombol Edit sebelum memulai."); return
+        if sensor["id"] in self.workers:
+            messagebox.showinfo("Mulai stasiun", f"{sensor['station']} sudah berjalan."); return
+        try:
+            running = [entry[0].sensor for entry in self.workers.values()]
+            endpoints = [(s["host"].lower(), int(s["port"])) for s in running + [sensor]]
+            names = [safe_station_name(s["station"]).lower() for s in running + [sensor]]
+            if len(endpoints) != len(set(endpoints)): raise ValueError("Endpoint sama dengan stasiun yang sedang berjalan")
+            if len(names) != len(set(names)): raise ValueError("Nama sama dengan stasiun yang sedang berjalan")
+            data_dir = Path(self.config_data["data_dir"]); data_dir.mkdir(parents=True, exist_ok=True)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Tidak dapat memulai", str(exc)); return
+        stop_event = threading.Event()
+        worker = SensorWorker(sensor, data_dir, self.events, stop_event)
+        self.workers[sensor["id"]] = (worker, stop_event)
+        worker.start(); self.stop_button.configure(state="normal")
+
+    def stop_selected(self):
+        sensor = self.selected()
+        if not sensor:
+            messagebox.showinfo("Hentikan stasiun", "Pilih satu stasiun terlebih dahulu."); return
+        entry = self.workers.pop(sensor["id"], None)
+        if not entry:
+            messagebox.showinfo("Hentikan stasiun", f"{sensor['station']} tidak sedang berjalan."); return
+        worker, stop_event = entry
+        stop_event.set(); worker.close_socket(); worker.join(timeout=3)
+        if not self.workers: self.stop_button.configure(state="disabled")
 
     def stop(self):
-        self.stop_event.set(); workers, self.workers = self.workers, []
-        for worker in workers: worker.close_socket()
-        for worker in workers: worker.join(timeout=3)
-        self.start_button.configure(state="normal"); self.stop_button.configure(state="disabled")
+        entries, self.workers = list(self.workers.values()), {}
+        for worker, stop_event in entries: stop_event.set(); worker.close_socket()
+        for worker, _stop_event in entries: worker.join(timeout=3)
+        self.stop_button.configure(state="disabled")
 
     def process_events(self):
         dirty = False
