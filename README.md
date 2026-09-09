@@ -66,16 +66,28 @@ Klik baris stasiun yang ingin dilihat, lalu pilih rentang:
 
 Data historis berasal dari rata-rata per menit di SQLite. Query dijalankan di background agar koneksi TCP tidak terhambat. Jika hasil melebihi 1.500 titik, aplikasi melakukan downsampling sebelum menggambar. Gunakan tombol **Muat ulang** untuk mengambil data terbaru. Data lebih lama dari tiga bulan tetap ada di CSV dan SQLite, tetapi tidak ditawarkan pada grafik agar tampilan tetap ringan.
 
-Grafik ditampilkan sebagai tiga panel vertikal untuk X, Y, dan temperatur. Gunakan menu **Grafik > Simpan grafik…** atau tombol **Simpan grafik** untuk membuat gambar. Masukkan waktu mulai dan selesai dalam format `YYYY-MM-DD HH:MM` (UTC), kemudian pilih format PNG, JPG, atau JPEG. File gambar dibuat pada 150 DPI.
+Grafik ditampilkan sebagai tiga panel vertikal untuk X, Y, dan temperatur. Gunakan toolbar navigasi di bawah grafik untuk **Zoom**, **Pan**, dan **Home/Reset** tampilan. Gunakan menu **Grafik > Simpan grafik…** atau tombol **Simpan grafik** untuk membuat gambar. Masukkan waktu mulai dan selesai dalam format `YYYY-MM-DD HH:MM` (UTC), kemudian pilih format PNG, JPG, atau JPEG. File gambar dibuat pada 150 DPI.
 
 ## Ekspor data
 
 Pilih stasiun dan rentang grafik, lalu gunakan **Pengaturan > Ekspor data CSV…** atau tombol **Ekspor CSV**. Pilihan historis yang tersedia adalah 1 hari, 1 minggu, 1 bulan, dan 3 bulan. Jika tampilan masih Real-time, aplikasi menawarkan ekspor data 1 hari terakhir. Hasil ekspor berformat CSV UTF-8 dan tidak terkena downsampling grafik.
 
+## Impor data lama
+
+Gunakan **Pengaturan > Impor data lama…**, lalu pilih **satu file CSV** atau **folder** yang berisi file CSV lama berformat Tilty. Jika memilih folder, semua subfolder akan dipindai. Nama stasiun pada CSV harus cocok dengan nama stasiun yang dikonfigurasi di aplikasi. Data valid dimasukkan ke `d701_history.sqlite3` sehingga dapat ditampilkan pada grafik dan diekspor kembali. Data dengan kombinasi stasiun dan timestamp yang sudah ada dianggap duplikat dan tidak dimasukkan dua kali. Setelah selesai, aplikasi menampilkan jumlah file, data baru, duplikat, baris rusak, dan stasiun yang tidak dikenal.
 ## Status koneksi
 
 Bagian kanan header menampilkan ringkasan jumlah stasiun yang **terhubung**, **menghubungkan**, dan **berhenti**. Kolom **Status** pada tabel menampilkan keadaan terkini masing-masing stasiun, termasuk proses koneksi, reconnect, atau pesan koneksi terputus.
 
+## Mulai otomatis saat Windows menyala
+
+Tilty otomatis memulai semua stasiun yang berstatus aktif saat aplikasi dibuka. Untuk menjalankan Tilty setelah PC restart atau listrik kembali, buat shortcut `Tilty.exe` di folder Startup Windows:
+
+1. Tekan `Win+R`.
+2. Ketik `shell:startup`, lalu tekan Enter.
+3. Salin shortcut Tilty ke folder tersebut.
+
+Jika NPort atau jaringan belum siap, worker akan mencoba terhubung kembali dengan jeda 2, 4, 8, 16, hingga maksimum 30 detik.
 ## Auto reconnect
 
 Reconnect selalu aktif dan independen untuk setiap stasiun. Jeda dimulai dari 2 detik, lalu 4, 8, 16, hingga maksimum 30 detik. Setelah koneksi berhasil, jeda kembali menjadi 2 detik.

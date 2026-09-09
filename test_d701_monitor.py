@@ -5,8 +5,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from d701_monitor import (DataWriter, MinuteAggregator, TimeSettingsRecorder,
-                          apply_calibration, downsample_rows, parse_d701_line,
-                          query_history)
+                          apply_calibration, downsample_rows, import_legacy_csv, parse_d701_line,
+                          query_export_rows, query_history)
 
 class TestD701Monitor(unittest.TestCase):
     def test_conversion(self):
@@ -57,6 +57,19 @@ class TestD701Monitor(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 3)
             self.assertEqual(rows[0]["utc_offset"], "UTC+07:00")
+    def test_import_legacy_csv_ignores_duplicates(self):
+        headers = ("timestamp_utc", "station", "x_urad", "y_urad", "temperature_c", "status", "sample_count")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); source = root / "old"; source.mkdir()
+            with (source / "old.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=headers); writer.writeheader()
+                writer.writerow(dict(zip(headers, ("2026-01-01T00:00:00.000Z", "STA", 1, 2, 38.99, "N", 60))))
+            sensors = [{"id": "station-id", "station": "STA"}]
+            first = import_legacy_csv(root / "data", source, sensors)
+            second = import_legacy_csv(root / "data", source, sensors)
+            rows = query_export_rows(root / "data", "station-id", datetime(2025, 1, 1, tzinfo=timezone.utc))
+            self.assertEqual((first["imported"], second["duplicates"], len(rows)), (1, 1, 1))
+            self.assertAlmostEqual(rows[0][4], 38.99)
     def test_average(self):
         agg = MinuteAggregator(); t = datetime(2026, 9, 8, 1, 2, 1, tzinfo=timezone.utc)
         agg.add(parse_d701_line("$ 1,2,20,N", "A", "host", t, factor_x=1, factor_y=1))

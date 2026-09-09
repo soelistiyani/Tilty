@@ -20,7 +20,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.dates import DateFormatter
 from matplotlib.figure import Figure
 
@@ -231,6 +231,58 @@ def query_export_rows(data_dir, station_id, since, until=None):
             sql += " AND timestamp_utc <= ?"
             params.append(iso_utc(until))
         return db.execute(sql + " ORDER BY timestamp_utc", params).fetchall()
+
+def import_legacy_csv(data_dir, source_dir, sensors):
+    """Index legacy minute CSV files into the history database without duplicates."""
+    source = Path(source_dir)
+    files = [source] if source.is_file() else sorted(source.rglob("*.csv"))
+    result = {"files": len(files), "imported": 0, "duplicates": 0, "invalid": 0, "unknown": 0}
+    station_ids = {}
+    for sensor in sensors:
+        station_ids[sensor["station"].strip().lower()] = sensor["id"]
+        station_ids[safe_station_name(sensor["station"]).lower()] = sensor["id"]
+    db_path = Path(data_dir) / "d701_history.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    required = {"timestamp_utc", "station", "x_urad", "y_urad", "temperature_c", "status", "sample_count"}
+    with closing(sqlite3.connect(db_path, timeout=30)) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=30000")
+        db.execute("""CREATE TABLE IF NOT EXISTS minute_readings (
+            station_id TEXT NOT NULL, station TEXT NOT NULL,
+            timestamp_utc TEXT NOT NULL, x_urad REAL NOT NULL,
+            y_urad REAL NOT NULL, temperature_c REAL NOT NULL,
+            status TEXT NOT NULL, sample_count INTEGER NOT NULL,
+            PRIMARY KEY (station_id, timestamp_utc))""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_minute_station_time ON minute_readings(station_id, timestamp_utc)")
+        sql = """INSERT OR IGNORE INTO minute_readings
+            (station_id, station, timestamp_utc, x_urad, y_urad, temperature_c, status, sample_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""
+        for path in files:
+            try:
+                with path.open(encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                        continue
+                    for row in reader:
+                        try:
+                            station = row["station"].strip()
+                            station_id = station_ids.get(station.lower()) or station_ids.get(safe_station_name(station).lower())
+                            if not station_id:
+                                result["unknown"] += 1; continue
+                            timestamp = datetime.fromisoformat(row["timestamp_utc"].strip().replace("Z", "+00:00"))
+                            if timestamp.tzinfo is None: timestamp = timestamp.replace(tzinfo=timezone.utc)
+                            values = (station_id, station, iso_utc(timestamp), float(row["x_urad"]),
+                                      float(row["y_urad"]), float(row["temperature_c"]),
+                                      row["status"].strip(), int(float(row["sample_count"])))
+                            cursor = db.execute(sql, values)
+                            if cursor.rowcount: result["imported"] += 1
+                            else: result["duplicates"] += 1
+                        except (KeyError, TypeError, ValueError):
+                            result["invalid"] += 1
+            except (OSError, csv.Error, UnicodeError):
+                result["invalid"] += 1
+        db.commit()
+    return result
 
 class TimeSettingsRecorder:
     FIELDS = ("observed_at_utc", "local_date", "local_time", "windows_timezone",
@@ -470,6 +522,7 @@ class MonitorApp(tk.Tk):
         self.historical = {}; self.history_request = 0; self.save_period = None
         self.build_ui(); self.refresh_table(); self.after(100, self.process_events); self.after(1000, self.refresh_plot)
         self.after(1200, self.check_time_setting)
+        self.after(500, self.auto_start)
     @staticmethod
     def load_config():
         for path in (CONFIG_PATH, LEGACY_CONFIG_PATH, APP_DIR / "config.json"):
@@ -487,6 +540,7 @@ class MonitorApp(tk.Tk):
         menu = tk.Menu(self); settings = tk.Menu(menu, tearoff=False)
         settings.add_command(label="Folder penyimpanan…", command=self.choose_folder)
         settings.add_command(label="Ekspor data CSV…", command=self.export_data)
+        settings.add_command(label="Impor data lama…", command=self.import_old_data)
         settings.add_separator()
         settings.add_command(label="Keluar", command=self.on_close)
         menu.add_cascade(label="Pengaturan", menu=settings)
@@ -547,6 +601,8 @@ class MonitorApp(tk.Tk):
             self.lines.append(axis.plot([], [], linestyle="none", marker="o", markersize=2.5, color="black", alpha=.8, zorder=3)[0])
         self.axes[-1].set_xlabel("Date Time (UTC)")
         self.canvas = FigureCanvasTkAgg(self.figure, master=self); self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self, pack_toolbar=False)
+        self.toolbar.update(); self.toolbar.pack(fill="x", padx=10, pady=(0, 8))
     def selected(self):
         ids = self.tree.selection()
         return next((s for s in self.config_data["sensors"] if ids and s["id"] == ids[0]), None)
@@ -626,6 +682,12 @@ class MonitorApp(tk.Tk):
             worker.start()
         self.stop_button.configure(state="normal")
 
+    def auto_start(self):
+        """Start enabled stations on launch for Windows Startup recovery."""
+        if self.workers or not any(s.get("enabled", True) for s in self.config_data["sensors"]):
+            return
+        self.start()
+
     def start_selected(self):
         sensor = self.selected()
         if not sensor:
@@ -680,6 +742,17 @@ class MonitorApp(tk.Tk):
                     request_id, error = payload
                     if request_id == self.history_request:
                         self.graph_status.set(f"Gagal membaca database: {error}")
+                elif kind == "import_done":
+                    self.historical.clear()
+                    self.graph_status.set(f"Impor selesai: {payload['imported']:,} data baru")
+                    messagebox.showinfo("Impor data lama",
+                        f"File diperiksa: {payload['files']:,}\nData baru: {payload['imported']:,}\n"
+                        f"Duplikat dilewati: {payload['duplicates']:,}\nBaris rusak: {payload['invalid']:,}\n"
+                        f"Stasiun tidak dikenal: {payload['unknown']:,}")
+                    self.load_selected_history(force=True)
+                elif kind == "import_error":
+                    self.graph_status.set("Impor data lama gagal")
+                    messagebox.showerror("Impor data lama gagal", str(payload))
                 elif kind == "reading":
                     h = self.history.setdefault(sid, {k: deque(maxlen=600) for k in ("t", "x", "y", "temp")})
                     for key, value in (("t", payload.timestamp), ("x", payload.x), ("y", payload.y), ("temp", payload.temperature)): h[key].append(value)
@@ -776,8 +849,11 @@ class MonitorApp(tk.Tk):
                                        ("X (µrad)", "Y (µrad)", "Temperature (°C)")):
             axis.scatter(times, values, color="black", s=6, alpha=.8, linewidths=0, rasterized=True, zorder=3)
             axis.set_ylabel(label); axis.grid(True, linestyle="--", alpha=.4, zorder=1); axis.set_xlim(start, end)
-        axes[-1].set_xlabel("Date Time (UTC)")
-        axes[-1].xaxis.set_major_formatter(DateFormatter("%Y-%m-%d\n%H:%M", tz=timezone.utc))
+            axis.ticklabel_format(axis="y", style="plain", useOffset=False)
+        for axis in axes[:-1]:
+            axis.tick_params(axis="x", which="both", labelbottom=False)
+        axes[-1].set_xlabel("Date (UTC)")
+        axes[-1].xaxis.set_major_formatter(DateFormatter("%Y-%m-%d", tz=timezone.utc))
         for tick in axes[-1].get_xticklabels(): tick.set_rotation(90); tick.set_ha("center")
         export_figure.suptitle(f"Data Tilt dan Suhu Stasiun {sensor['station']}\nPeriode {start:%Y-%m-%d %H:%M} s.d. {end:%Y-%m-%d %H:%M} UTC",
                                fontsize=11, fontweight="bold")
@@ -788,6 +864,30 @@ class MonitorApp(tk.Tk):
             messagebox.showinfo("Simpan grafik", f"Grafik berhasil disimpan ke:\n{destination}")
         except OSError as exc:
             messagebox.showerror("Gagal menyimpan grafik", str(exc))
+    def import_old_data(self):
+        if not self.editable(): return
+        single_file = messagebox.askyesno("Impor data lama",
+            "Impor satu file CSV saja? Pilih Tidak untuk mengimpor satu folder beserta subfoldernya.")
+        if single_file:
+            source = filedialog.askopenfilename(title="Pilih file CSV lama",
+                filetypes=(("CSV UTF-8", "*.csv"), ("Semua file", "*.*")))
+            confirm_text = "File CSV yang dipilih akan diimpor. Lanjutkan?"
+        else:
+            source = filedialog.askdirectory(title="Pilih folder data lama")
+            confirm_text = "Semua CSV format Tilty di dalam folder ini dan subfoldernya akan diperiksa. Lanjutkan?"
+        if not source or not messagebox.askyesno("Impor data lama", confirm_text):
+            return
+        self.graph_status.set("Mengimpor data lama…")
+        sensors = [sensor.copy() for sensor in self.config_data["sensors"]]
+        data_dir = self.config_data["data_dir"]
+        def run_import():
+            try:
+                result = import_legacy_csv(data_dir, source, sensors)
+                self.events.put(("import_done", "", result))
+            except (OSError, sqlite3.Error) as exc:
+                self.events.put(("import_error", "", str(exc)))
+        threading.Thread(target=run_import, name="Tilty-Legacy-Import", daemon=True).start()
+
     def export_data(self):
         sensor = self.selected()
         if not sensor:
