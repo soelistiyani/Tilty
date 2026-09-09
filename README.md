@@ -8,6 +8,9 @@
 - Akuisisi dapat dimulai/dihentikan untuk stasiun yang dipilih atau semua stasiun sekaligus.
 - Reconnect otomatis per stasiun.
 - Grafik real-time dan historis X, Y, dan temperatur.
+- Ringkasan status koneksi terkini serta status detail per stasiun.
+- Ekspor data historis stasiun ke CSV UTF-8.
+- Penyimpanan grafik berdasarkan rentang waktu pilihan pengguna ke PNG atau JPG.
 - Menu kalibrasi per stasiun.
 - Raw log dan rata-rata per menit dalam CSV.
 - SQLite sebagai indeks internal untuk grafik historis.
@@ -62,6 +65,16 @@ Klik baris stasiun yang ingin dilihat, lalu pilih rentang:
 - **3 Bulan**
 
 Data historis berasal dari rata-rata per menit di SQLite. Query dijalankan di background agar koneksi TCP tidak terhambat. Jika hasil melebihi 1.500 titik, aplikasi melakukan downsampling sebelum menggambar. Gunakan tombol **Muat ulang** untuk mengambil data terbaru. Data lebih lama dari tiga bulan tetap ada di CSV dan SQLite, tetapi tidak ditawarkan pada grafik agar tampilan tetap ringan.
+
+Grafik ditampilkan sebagai tiga panel vertikal untuk X, Y, dan temperatur. Gunakan menu **Grafik > Simpan grafik…** atau tombol **Simpan grafik** untuk membuat gambar. Masukkan waktu mulai dan selesai dalam format `YYYY-MM-DD HH:MM` (UTC), kemudian pilih format PNG, JPG, atau JPEG. File gambar dibuat pada 150 DPI.
+
+## Ekspor data
+
+Pilih stasiun dan rentang grafik, lalu gunakan **Pengaturan > Ekspor data CSV…** atau tombol **Ekspor CSV**. Pilihan historis yang tersedia adalah 1 hari, 1 minggu, 1 bulan, dan 3 bulan. Jika tampilan masih Real-time, aplikasi menawarkan ekspor data 1 hari terakhir. Hasil ekspor berformat CSV UTF-8 dan tidak terkena downsampling grafik.
+
+## Status koneksi
+
+Bagian kanan header menampilkan ringkasan jumlah stasiun yang **terhubung**, **menghubungkan**, dan **berhenti**. Kolom **Status** pada tabel menampilkan keadaan terkini masing-masing stasiun, termasuk proses koneksi, reconnect, atau pesan koneksi terputus.
 
 ## Auto reconnect
 

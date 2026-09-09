@@ -201,17 +201,36 @@ def downsample_rows(rows, max_points=1500):
     return result
 
 
-def query_history(data_dir, station_id, since, max_points=1500):
+def query_history(data_dir, station_id, since, max_points=1500, until=None):
     path = Path(data_dir) / "d701_history.sqlite3"
     if not path.exists():
         return []
     with closing(sqlite3.connect(path, timeout=10)) as db:
-        rows = db.execute("""SELECT timestamp_utc, x_urad, y_urad, temperature_c
-            FROM minute_readings WHERE station_id = ? AND timestamp_utc >= ?
-            ORDER BY timestamp_utc""", (station_id, iso_utc(since))).fetchall()
+        sql = """SELECT timestamp_utc, x_urad, y_urad, temperature_c
+            FROM minute_readings WHERE station_id = ? AND timestamp_utc >= ?"""
+        params = [station_id, iso_utc(since)]
+        if until is not None:
+            sql += " AND timestamp_utc <= ?"
+            params.append(iso_utc(until))
+        rows = db.execute(sql + " ORDER BY timestamp_utc", params).fetchall()
     parsed = [(datetime.fromisoformat(row[0].replace("Z", "+00:00")), row[1], row[2], row[3]) for row in rows]
     return downsample_rows(parsed, max_points)
 
+
+def query_export_rows(data_dir, station_id, since, until=None):
+    """Return complete minute rows for CSV export without graph downsampling."""
+    path = Path(data_dir) / "d701_history.sqlite3"
+    if not path.exists():
+        return []
+    with closing(sqlite3.connect(path, timeout=15)) as db:
+        sql = """SELECT timestamp_utc, station, x_urad, y_urad,
+            temperature_c, status, sample_count
+            FROM minute_readings WHERE station_id = ? AND timestamp_utc >= ?"""
+        params = [station_id, iso_utc(since)]
+        if until is not None:
+            sql += " AND timestamp_utc <= ?"
+            params.append(iso_utc(until))
+        return db.execute(sql + " ORDER BY timestamp_utc", params).fetchall()
 
 class TimeSettingsRecorder:
     FIELDS = ("observed_at_utc", "local_date", "local_time", "windows_timezone",
@@ -401,6 +420,41 @@ class CalibrationDialog(simpledialog.Dialog):
 
     def apply(self): self.result = self.sensor
 
+class CustomPeriodDialog(simpledialog.Dialog):
+    FORMAT = "%Y-%m-%d %H:%M"
+
+    def body(self, master):
+        ttk.Label(master, text="Periode grafik dalam waktu UTC", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(master, text="Mulai (YYYY-MM-DD HH:MM)").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Label(master, text="Selesai (YYYY-MM-DD HH:MM)").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
+        end = utc_now().replace(second=0, microsecond=0)
+        start = end - timedelta(days=7)
+        current = getattr(self.parent, "save_period", None)
+        if current:
+            start, end = current
+        self.start_var = tk.StringVar(value=start.strftime(self.FORMAT))
+        self.end_var = tk.StringVar(value=end.strftime(self.FORMAT))
+        start_entry = ttk.Entry(master, textvariable=self.start_var, width=22)
+        ttk.Entry(master, textvariable=self.end_var, width=22).grid(row=2, column=1, sticky="ew", pady=4)
+        start_entry.grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(master, text="Tanggal dan waktu akhir termasuk dalam grafik.", foreground="#627D98").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        return start_entry
+
+    def validate(self):
+        try:
+            start = datetime.strptime(self.start_var.get().strip(), self.FORMAT).replace(tzinfo=timezone.utc)
+            end = datetime.strptime(self.end_var.get().strip(), self.FORMAT).replace(tzinfo=timezone.utc)
+            if end <= start:
+                raise ValueError("Waktu selesai harus setelah waktu mulai.")
+            self.period = (start, end)
+            return True
+        except ValueError as exc:
+            messagebox.showerror("Periode tidak valid", str(exc), parent=self)
+            return False
+
+    def apply(self):
+        self.result = self.period
+
 
 class MonitorApp(tk.Tk):
     RANGE_DAYS = {"1 Hari": 1, "1 Minggu": 7, "1 Bulan": 30, "3 Bulan": 90}
@@ -413,10 +467,9 @@ class MonitorApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.events, self.workers = queue.Queue(), {}
         self.config_data = self.load_config(); self.status = {}; self.latest = {}; self.counts = {}; self.history = {}
-        self.historical = {}; self.history_request = 0
+        self.historical = {}; self.history_request = 0; self.save_period = None
         self.build_ui(); self.refresh_table(); self.after(100, self.process_events); self.after(1000, self.refresh_plot)
         self.after(1200, self.check_time_setting)
-
     @staticmethod
     def load_config():
         for path in (CONFIG_PATH, LEGACY_CONFIG_PATH, APP_DIR / "config.json"):
@@ -430,10 +483,20 @@ class MonitorApp(tk.Tk):
         CONFIG_PATH.write_text(json.dumps(self.config_data, indent=2), encoding="utf-8")
 
     def build_ui(self):
+        self.range_var = tk.StringVar(value="Real-time")
         menu = tk.Menu(self); settings = tk.Menu(menu, tearoff=False)
         settings.add_command(label="Folder penyimpanan…", command=self.choose_folder)
+        settings.add_command(label="Ekspor data CSV…", command=self.export_data)
+        settings.add_separator()
         settings.add_command(label="Keluar", command=self.on_close)
         menu.add_cascade(label="Pengaturan", menu=settings)
+        graph_menu = tk.Menu(menu, tearoff=False)
+        for label in ("Real-time", "1 Hari", "1 Minggu", "1 Bulan", "3 Bulan"):
+            graph_menu.add_radiobutton(label=label, variable=self.range_var, value=label,
+                                       command=self.set_graph_period)
+        graph_menu.add_separator()
+        graph_menu.add_command(label="Simpan grafik…", command=self.save_graph)
+        menu.add_cascade(label="Grafik", menu=graph_menu)
         menu.add_command(label="Kalibrasi", command=self.calibrate)
         menu.add_command(label="Tentang", command=lambda: messagebox.showinfo(
             "Tentang Tilty", "Tilty: Tiltmeter TCP Monitor\nOutput tilt: microradian.\n\n"
@@ -447,6 +510,8 @@ class MonitorApp(tk.Tk):
         title_box = ttk.Frame(header); title_box.pack(side="left")
         ttk.Label(title_box, text="Tilty", font=("Segoe UI", 22, "bold")).pack(anchor="w")
         ttk.Label(title_box, text="Multi-station Tiltmeter TCP Monitor").pack(anchor="w")
+        self.connection_status = tk.StringVar(value="Koneksi: 0 terhubung · 0 menghubungkan · 0 berhenti")
+        ttk.Label(header, textvariable=self.connection_status).pack(side="right", padx=(12, 4))
         panel = ttk.LabelFrame(self, text="Stasiun NPort (TCP Server)", padding=8); panel.pack(fill="x", padx=10, pady=10)
         columns = ("active", "station", "endpoint", "status", "latest", "count")
         self.tree = ttk.Treeview(panel, columns=columns, show="headings", height=6, selectmode="browse")
@@ -462,25 +527,26 @@ class MonitorApp(tk.Tk):
         ttk.Button(buttons, text="Hentikan dipilih", command=self.stop_selected).pack(side="left", padx=(0, 6))
         self.start_button = ttk.Button(buttons, text="Mulai semua", command=self.start); self.start_button.pack(side="left", padx=(8, 6))
         self.stop_button = ttk.Button(buttons, text="Hentikan semua", command=self.stop, state="disabled"); self.stop_button.pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Ekspor CSV", command=self.export_data).pack(side="left", padx=(8, 6))
         ttk.Button(buttons, text="Buka folder data", command=self.open_folder).pack(side="left")
         self.folder_text = tk.StringVar(value=self.config_data["data_dir"]); ttk.Label(panel, textvariable=self.folder_text).pack(fill="x", pady=(7, 0))
         graph_controls = ttk.Frame(self); graph_controls.pack(fill="x", padx=10, pady=(0, 4))
         ttk.Label(graph_controls, text="Rentang grafik:").pack(side="left")
-        self.range_var = tk.StringVar(value="Real-time")
         ranges = ttk.Combobox(graph_controls, textvariable=self.range_var, state="readonly", width=14,
                               values=("Real-time", "1 Hari", "1 Minggu", "1 Bulan", "3 Bulan"))
-        ranges.pack(side="left", padx=6); ranges.bind("<<ComboboxSelected>>", lambda _e: self.load_selected_history())
+        ranges.pack(side="left", padx=6); ranges.bind("<<ComboboxSelected>>", lambda _e: self.set_graph_period())
         ttk.Button(graph_controls, text="Muat ulang", command=lambda: self.load_selected_history(True)).pack(side="left")
+        ttk.Button(graph_controls, text="Simpan grafik", command=self.save_graph).pack(side="left", padx=6)
         self.graph_status = tk.StringVar(value="Menampilkan sampel real-time terakhir")
         ttk.Label(graph_controls, textvariable=self.graph_status).pack(side="left", padx=8)
         self.figure = Figure(figsize=(10, 5), dpi=100, constrained_layout=True); self.lines = []
-        self.axes = [self.figure.add_subplot(311), self.figure.add_subplot(312), self.figure.add_subplot(313)]
-        for axis, title, unit in zip(self.axes, ("Tilt X", "Tilt Y", "Temperatur"), ("µrad", "µrad", "°C")):
-            axis.set_title(title); axis.set_ylabel(unit); axis.grid(True, alpha=.25)
-            self.lines.append(axis.plot([], [], color="#2463eb", linewidth=1)[0])
-        self.axes[-1].set_xlabel("Waktu UTC"); self.axes[-1].xaxis.set_major_formatter(DateFormatter("%H:%M:%S", tz=timezone.utc))
+        first_axis = self.figure.add_subplot(311)
+        self.axes = [first_axis, self.figure.add_subplot(312, sharex=first_axis), self.figure.add_subplot(313, sharex=first_axis)]
+        for axis, label in zip(self.axes, ("X (µrad)", "Y (µrad)", "Temperature (°C)")):
+            axis.set_ylabel(label); axis.grid(True, linestyle="--", alpha=.4, zorder=1)
+            self.lines.append(axis.plot([], [], linestyle="none", marker="o", markersize=2.5, color="black", alpha=.8, zorder=3)[0])
+        self.axes[-1].set_xlabel("Date Time (UTC)")
         self.canvas = FigureCanvasTkAgg(self.figure, master=self); self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
     def selected(self):
         ids = self.tree.selection()
         return next((s for s in self.config_data["sensors"] if ids and s["id"] == ids[0]), None)
@@ -492,6 +558,15 @@ class MonitorApp(tk.Tk):
                 f"{s['host']}:{s['port']}", self.status.get(s["id"], "Berhenti"), self.latest.get(s["id"], "—"), self.counts.get(s["id"], 0)))
         children = self.tree.get_children()
         if children: self.tree.selection_set(selected[0] if selected and selected[0] in children else children[0])
+        self.update_connection_summary()
+
+    def update_connection_summary(self):
+        connected = sum(self.status.get(s["id"]) == "Terhubung" for s in self.config_data["sensors"])
+        connecting = sum(s["id"] in self.workers and self.status.get(s["id"]) != "Terhubung"
+                         for s in self.config_data["sensors"])
+        stopped = len(self.config_data["sensors"]) - connected - connecting
+        self.connection_status.set(
+            f"Koneksi: {connected} terhubung · {connecting} menghubungkan · {stopped} berhenti")
 
     def editable(self):
         if self.workers: messagebox.showwarning("Akuisisi berjalan", "Hentikan akuisisi sebelum mengubah konfigurasi."); return False
@@ -614,6 +689,10 @@ class MonitorApp(tk.Tk):
         if dirty: self.refresh_table()
         self.after(100, self.process_events)
 
+    def set_graph_period(self):
+        self.load_selected_history()
+        self.refresh_plot(schedule=False)
+
     def load_selected_history(self, force=False):
         sensor = self.selected()
         label = self.range_var.get()
@@ -637,18 +716,108 @@ class MonitorApp(tk.Tk):
                 self.events.put(("history_error", station_id, (request_id, str(exc))))
         threading.Thread(target=load, name="D701-History", daemon=True).start()
 
-    def refresh_plot(self):
+    def refresh_plot(self, schedule=True):
         sensor = self.selected(); history = self.history.get(sensor["id"]) if sensor else None
-        if sensor: self.figure.suptitle(sensor["station"])
-        if sensor and self.range_var.get() != "Real-time":
-            rows = self.historical.get((sensor["id"], self.range_var.get()), [])
-            values = {"t": [r[0] for r in rows], "x": [r[1] for r in rows],
-                      "y": [r[2] for r in rows], "temp": [r[3] for r in rows]}
-            history = values
-        for line, key in zip(self.lines, ("x", "y", "temp")): line.set_data(list(history["t"]), list(history[key])) if history else line.set_data([], [])
+        label = self.range_var.get()
+        if sensor and label != "Real-time":
+            rows = self.historical.get((sensor["id"], label), [])
+            history = {"t": [r[0] for r in rows], "x": [r[1] for r in rows],
+                       "y": [r[2] for r in rows], "temp": [r[3] for r in rows]}
+        for line, key in zip(self.lines, ("x", "y", "temp")):
+            line.set_data(list(history["t"]), list(history[key])) if history else line.set_data([], [])
         for axis in self.axes: axis.relim(); axis.autoscale_view()
-        self.canvas.draw_idle(); self.after(max(500, int(self.config_data.get("refresh_seconds", 2)*1000)), self.refresh_plot)
+        if label == "Real-time":
+            formatter, rotation = DateFormatter("%H:%M:%S", tz=timezone.utc), 0
+            period_text = "Real-time"
+        else:
+            formatter, rotation = DateFormatter("%Y-%m-%d", tz=timezone.utc), 90
+            period_text = f"{label} terakhir"
+            end = utc_now(); start = end - timedelta(days=self.RANGE_DAYS[label])
+            for axis in self.axes: axis.set_xlim(start, end)
+        self.axes[-1].xaxis.set_major_formatter(formatter)
+        for tick in self.axes[-1].get_xticklabels():
+            tick.set_rotation(rotation); tick.set_ha("center")
+        title = f"Data Tilt dan Suhu Stasiun {sensor['station']}\nPeriode {period_text}" if sensor else "Data Tilt dan Suhu"
+        self.figure.suptitle(title, fontsize=11, fontweight="bold")
+        self.canvas.draw_idle()
+        if schedule:
+            self.after(max(500, int(self.config_data.get("refresh_seconds", 2)*1000)), self.refresh_plot)
 
+    def save_graph(self):
+        sensor = self.selected()
+        if not sensor:
+            messagebox.showinfo("Simpan grafik", "Pilih satu stasiun terlebih dahulu.")
+            return
+        dialog = CustomPeriodDialog(self, "Rentang Waktu Grafik")
+        if not dialog.result:
+            return
+        start, end = dialog.result
+        self.save_period = (start, end)
+        try:
+            rows = query_history(self.config_data["data_dir"], sensor["id"], start, max_points=5000, until=end)
+        except sqlite3.Error as exc:
+            messagebox.showerror("Gagal membaca data", str(exc)); return
+        if not rows:
+            messagebox.showinfo("Simpan grafik", "Tidak ada data pada rentang waktu tersebut.")
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Simpan grafik", defaultextension=".png",
+            filetypes=(("PNG image", "*.png"), ("JPEG image", "*.jpg;*.jpeg")),
+            initialfile=f"Grafik_{safe_station_name(sensor['station'])}_{start:%Y%m%d_%H%M}_{end:%Y%m%d_%H%M}.png")
+        if not destination: return
+        suffix = Path(destination).suffix.lower()
+        if suffix not in (".png", ".jpg", ".jpeg"):
+            destination += ".png"; suffix = ".png"
+        export_figure = Figure(figsize=(9, 6), dpi=100, constrained_layout=True)
+        first_axis = export_figure.add_subplot(311)
+        axes = [first_axis, export_figure.add_subplot(312, sharex=first_axis), export_figure.add_subplot(313, sharex=first_axis)]
+        times = [row[0] for row in rows]
+        for axis, values, label in zip(axes, ([row[1] for row in rows], [row[2] for row in rows], [row[3] for row in rows]),
+                                       ("X (µrad)", "Y (µrad)", "Temperature (°C)")):
+            axis.scatter(times, values, color="black", s=6, alpha=.8, linewidths=0, rasterized=True, zorder=3)
+            axis.set_ylabel(label); axis.grid(True, linestyle="--", alpha=.4, zorder=1); axis.set_xlim(start, end)
+        axes[-1].set_xlabel("Date Time (UTC)")
+        axes[-1].xaxis.set_major_formatter(DateFormatter("%Y-%m-%d\n%H:%M", tz=timezone.utc))
+        for tick in axes[-1].get_xticklabels(): tick.set_rotation(90); tick.set_ha("center")
+        export_figure.suptitle(f"Data Tilt dan Suhu Stasiun {sensor['station']}\nPeriode {start:%Y-%m-%d %H:%M} s.d. {end:%Y-%m-%d %H:%M} UTC",
+                               fontsize=11, fontweight="bold")
+        try:
+            export_figure.savefig(destination, dpi=150, format="jpeg" if suffix in (".jpg", ".jpeg") else "png",
+                                  bbox_inches="tight", facecolor="white")
+            self.graph_status.set(f"Grafik disimpan: {Path(destination).name}")
+            messagebox.showinfo("Simpan grafik", f"Grafik berhasil disimpan ke:\n{destination}")
+        except OSError as exc:
+            messagebox.showerror("Gagal menyimpan grafik", str(exc))
+    def export_data(self):
+        sensor = self.selected()
+        if not sensor:
+            messagebox.showinfo("Ekspor data", "Pilih satu stasiun terlebih dahulu.")
+            return
+        label = self.range_var.get()
+        days = self.RANGE_DAYS.get(label, 1)
+        if label == "Real-time":
+            if not messagebox.askyesno("Ekspor data", "Rentang grafik masih Real-time. Ekspor data 1 hari terakhir?"):
+                return
+            label = "1 Hari"
+        destination = filedialog.asksaveasfilename(
+            title="Ekspor data CSV", defaultextension=".csv",
+            filetypes=(("CSV UTF-8", "*.csv"), ("Semua file", "*.*")),
+            initialfile=f"{safe_station_name(sensor['station'])}_{label.replace(' ', '_')}_{utc_now():%Y%m%d}.csv")
+        if not destination: return
+        try:
+            since = utc_now() - timedelta(days=days)
+            rows = query_export_rows(self.config_data["data_dir"], sensor["id"], since)
+            if not rows:
+                messagebox.showinfo("Ekspor data", f"Tidak ada data {sensor['station']} untuk rentang {label}.")
+                return
+            with Path(destination).open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(("timestamp_utc", "station", "x_urad", "y_urad", "temperature_c", "status", "sample_count"))
+                writer.writerows(rows)
+            self.graph_status.set(f"Ekspor selesai: {len(rows):,} baris")
+            messagebox.showinfo("Ekspor selesai", f"{len(rows):,} baris data disimpan ke:\n{destination}")
+        except (OSError, sqlite3.Error) as exc:
+            messagebox.showerror("Ekspor gagal", str(exc))
     def open_folder(self):
         path = Path(self.config_data["data_dir"]); path.mkdir(parents=True, exist_ok=True); os.startfile(path)
 
