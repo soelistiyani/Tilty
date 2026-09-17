@@ -9,6 +9,10 @@ from d701_monitor import (DataWriter, MinuteAggregator, TimeSettingsRecorder,
                           query_export_rows, query_history)
 
 class TestD701Monitor(unittest.TestCase):
+    def test_application_version(self):
+        from d701_monitor import APP_VERSION
+        self.assertEqual(APP_VERSION, "1.7.0")
+
     def test_conversion(self):
         at = datetime(2026, 9, 8, 1, 2, 3, tzinfo=timezone.utc)
         r = parse_d701_line("$ 0.0076,-0.0623,26.34,N2343", "A", "host", at)
@@ -70,6 +74,32 @@ class TestD701Monitor(unittest.TestCase):
             rows = query_export_rows(root / "data", "station-id", datetime(2025, 1, 1, tzinfo=timezone.utc))
             self.assertEqual((first["imported"], second["duplicates"], len(rows)), (1, 1, 1))
             self.assertAlmostEqual(rows[0][4], 38.99)
+    def test_metadata_defaults_and_legacy_config_migration(self):
+        from d701_monitor import default_metadata, normalize_config
+        fields = default_metadata()
+        for key in ("code", "latitude", "manufacturer", "n_samp", "output_unit",
+                    "logger_model", "timestamp_source", "time_sync"):
+            self.assertIn(key, fields)
+        legacy = {"sensors": [{"station": "OLD", "host": "127.0.0.1", "port": 4001}]}
+        migrated = normalize_config(legacy)["sensors"][0]
+        self.assertEqual(migrated["metadata"]["datum"], "WGS84")
+        self.assertEqual(migrated["metadata"]["output_unit"], "microradian")
+
+    def test_metadata_snapshot_and_history_log(self):
+        from d701_monitor import new_sensor, write_metadata_snapshot
+        with tempfile.TemporaryDirectory() as temp:
+            sensor = new_sensor("TEST STATION", "127.0.0.1")
+            sensor["metadata"].update(code="TST-01", positive_direction="+X menuju puncak",
+                                      updated_at_utc="2026-09-17T00:00:00.000Z")
+            current, history = write_metadata_snapshot(temp, sensor)
+            self.assertTrue(current.exists())
+            self.assertTrue(history.exists())
+            self.assertEqual(current.name, "TEST_STATION_metadata.txt")
+            self.assertEqual(history.name, "TEST_STATION_metadata_history.log")
+            self.assertIn("Kode stasiun: TST-01", current.read_text(encoding="utf-8"))
+            write_metadata_snapshot(temp, sensor)
+            self.assertEqual(history.read_text(encoding="utf-8").count("TILTY STATION METADATA"), 2)
+
     def test_average(self):
         agg = MinuteAggregator(); t = datetime(2026, 9, 8, 1, 2, 1, tzinfo=timezone.utc)
         agg.add(parse_d701_line("$ 1,2,20,N", "A", "host", t, factor_x=1, factor_y=1))

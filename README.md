@@ -5,6 +5,7 @@
 ## Fitur
 
 - Daftar stasiun dinamis: tambah, edit, hapus, dan aktif/nonaktif.
+- Wizard metadata stasiun bertahap dengan validasi, ringkasan, dan penyimpanan draf.
 - Akuisisi dapat dimulai/dihentikan untuk stasiun yang dipilih atau semua stasiun sekaligus.
 - Reconnect otomatis per stasiun.
 - Grafik real-time dan historis X, Y, dan temperatur.
@@ -94,11 +95,53 @@ Reconnect selalu aktif dan independen untuk setiap stasiun. Jeda dimulai dari 2 
 
 ## Tentang
 
+```text
 Tilty: Tiltmeter TCP Monitor
+Versi: 1.7.0
 
-Output tilt: microradian.
+Oleh: Sulistiyani
+Tahun: 2026
+```
 
-Didesain dan dikembangkan oleh Sulistiyani (`soelistiyani@gmail.com`).
+## Metadata stasiun
+
+Setiap baris pada tabel mewakili satu stasiun. Klik **Tambah** untuk mengisi koneksi TCP; setelah koneksi disimpan, wizard metadata untuk stasiun baru terbuka otomatis. Untuk stasiun yang sudah ada, pilih barisnya lalu klik **Metadata** atau gunakan menu **Metadata**. Form dibagi menjadi lima langkah agar informasi teknis tidak tampil sekaligus:
+
+1. **Stasiun**: nama, kode, tanggal mulai/selesai, dan jenis lokasi.
+2. **Lokasi**: koordinat, elevasi, datum, kedalaman, dan orientasi sensor.
+3. **Perangkat**: merek, model, serial number, firmware, konfigurasi internal (`N_SAMP`, gain, filter), dan output unit.
+4. **Akuisisi**: identitas data logger, sumber timestamp, timezone, dan sinkronisasi waktu.
+5. **Tinjau**: ringkasan sebelum metadata disimpan.
+
+Gunakan **Simpan draf** jika metadata belum lengkap. Tombol **Simpan metadata** pada langkah terakhir memeriksa field utama, format tanggal `YYYY-MM-DD`, rentang koordinat, dan azimuth. Untuk arah positif, gunakan keterangan eksplisit, misalnya `+X menuju puncak (azimuth 315°); +Y 90° searah jarum jam dari +X`.
+
+Metadata disimpan bersama konfigurasi sensor di `%LOCALAPPDATA%\Tilty\config.json`. Setiap penyimpanan juga membuat:
+
+- `NAMA_STASIUN\NAMA_STASIUN_metadata.txt`: snapshot metadata terbaru.
+- `NAMA_STASIUN\NAMA_STASIUN_metadata_history.log`: riwayat append-only setiap perubahan metadata.
+
+Contoh untuk stasiun **Wolorona**:
+
+```text
+Documents\Tilty Data\Wolorona\Wolorona_metadata.txt
+Documents\Tilty Data\Wolorona\Wolorona_metadata_history.log
+```
+
+Spasi dan karakter yang tidak aman pada nama stasiun diganti dengan garis bawah. Contohnya, stasiun `Lewotobi Barat` menghasilkan `Lewotobi_Barat_metadata.txt`.
+
+## Kompatibilitas dan upgrade
+
+Penambahan metadata tidak mengubah skema `d701_history.sqlite3`. Database SQLite, CSV, raw log, konfigurasi koneksi, dan kalibrasi dari versi lama tetap dapat digunakan. Konfigurasi lama otomatis mendapatkan struktur metadata kosong saat dibaca.
+
+Untuk memperbarui instalasi lama:
+
+1. Klik **Hentikan semua**, lalu tutup Tilty.
+2. Cadangkan `%LOCALAPPDATA%\Tilty\config.json` dan seluruh folder data, biasanya `Documents\Tilty Data`.
+3. Jalankan installer baru di lokasi instalasi yang sama. Tidak perlu menghapus versi lama terlebih dahulu.
+4. Buka Tilty dan periksa daftar stasiun, folder penyimpanan, serta grafik historis.
+5. Pilih setiap stasiun dan lengkapi metadata baru secara bertahap.
+
+Mengganti nama stasiun tidak memutus riwayat SQLite karena data dicari menggunakan ID stasiun. Namun, raw log dan CSV baru akan menggunakan folder berdasarkan nama stasiun yang baru.
 
 ## Menjalankan dari source
 
@@ -117,6 +160,12 @@ python -m unittest -v test_d701_monitor.py
 Simulator memakai `127.0.0.1:4001` dan `127.0.0.1:4002`.
 
 ## Membuat installer
+
+Untuk membuat rilis `1.7.0`, pastikan versi pada `installer.iss`:
+
+```iss
+#define MyAppVersion "1.7.0"
+```
 
 Install Inno Setup 6, kemudian jalankan PowerShell:
 

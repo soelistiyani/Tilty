@@ -1,5 +1,5 @@
 #define MyAppName "Tilty"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.7.0"
 #define MyAppExeName "Tilty.exe"
 [Setup]
 AppId={{A2ED436B-946F-4FA2-B08B-6EE4A6F8493C}

@@ -26,6 +26,7 @@ from matplotlib.figure import Figure
 
 APP_DIR = Path(__file__).resolve().parent
 APP_NAME = "Tilty"
+APP_VERSION = "1.7.0"
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", APP_DIR)) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LEGACY_CONFIG_PATH = Path(os.environ.get("LOCALAPPDATA", APP_DIR)) / "D701Monitor" / "config.json"
@@ -99,6 +100,71 @@ def apply_calibration(value_deg, zero_deg=0.0, factor_urad_per_deg=DEG_TO_URAD):
     return (value_deg - zero_deg) * factor_urad_per_deg
 
 
+def default_metadata():
+    """Return a complete, JSON-friendly metadata draft for one deployment."""
+    return {
+        "code": "", "start_date": "", "end_date": "", "location_type": "",
+        "latitude": "", "longitude": "", "elevation_m": "", "datum": "WGS84",
+        "depth_m": "", "location_notes": "",
+        "manufacturer": "", "model": "", "serial_number": "", "firmware": "",
+        "axis_x_azimuth_deg": "", "axis_y_azimuth_deg": "", "orientation_reference": "True north",
+        "positive_direction": "", "n_samp": "", "gain": "", "filter": "",
+        "output_unit": "microradian",
+        "logger_manufacturer": "", "logger_model": "", "logger_serial_number": "",
+        "logger_firmware": "", "timestamp_source": "Data logger", "timezone": "UTC",
+        "time_sync": "NTP", "time_server": "", "sync_interval": "",
+        "notes": "", "updated_at_utc": "",
+    }
+
+
+def normalize_metadata(source=None):
+    result = default_metadata()
+    if isinstance(source, dict):
+        result.update({key: "" if value is None else str(value)
+                       for key, value in source.items() if key in result})
+    return result
+METADATA_LABELS = {
+    "code": "Kode stasiun", "start_date": "Tanggal mulai", "end_date": "Tanggal selesai",
+    "location_type": "Jenis lokasi", "latitude": "Latitude", "longitude": "Longitude",
+    "elevation_m": "Elevasi (m)", "datum": "Datum", "depth_m": "Kedalaman (m)",
+    "location_notes": "Catatan lokasi", "manufacturer": "Merek sensor", "model": "Model sensor",
+    "serial_number": "Serial number sensor", "firmware": "Firmware sensor",
+    "axis_x_azimuth_deg": "Azimuth +X (derajat)", "axis_y_azimuth_deg": "Azimuth +Y (derajat)",
+    "orientation_reference": "Referensi orientasi", "positive_direction": "Konvensi arah positif",
+    "n_samp": "N_SAMP", "gain": "Gain", "filter": "Filter", "output_unit": "Output unit",
+    "logger_manufacturer": "Merek data logger", "logger_model": "Model data logger",
+    "logger_serial_number": "Serial number data logger", "logger_firmware": "Firmware data logger",
+    "timestamp_source": "Sumber timestamp", "timezone": "Timezone", "time_sync": "Sinkronisasi waktu",
+    "time_server": "Server / sumber waktu", "sync_interval": "Interval sinkronisasi",
+    "notes": "Catatan deployment", "updated_at_utc": "Terakhir diperbarui (UTC)",
+}
+
+
+def write_metadata_snapshot(data_dir, sensor, recorded_at=None):
+    """Write the latest human-readable metadata and append an audit snapshot."""
+    metadata = normalize_metadata(sensor.get("metadata"))
+    timestamp = recorded_at or metadata.get("updated_at_utc") or iso_utc(utc_now())
+    station = sensor.get("station", "UNKNOWN").strip() or "UNKNOWN"
+    safe_name = safe_station_name(station)
+    folder = Path(data_dir) / safe_name
+    folder.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "TILTY STATION METADATA",
+        f"Recorded at UTC: {timestamp}",
+        f"Station ID: {sensor.get('id', '')}",
+        f"Station name: {station}",
+    ]
+    lines.extend(f"{METADATA_LABELS[key]}: {metadata.get(key, '')}" for key in default_metadata())
+    snapshot = "\n".join(lines) + "\n"
+    current_path = folder / f"{safe_name}_metadata.txt"
+    current_path.write_text(snapshot, encoding="utf-8")
+    history_path = folder / f"{safe_name}_metadata_history.log"
+    with history_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n" + "=" * 72 + "\n" + snapshot)
+    return current_path, history_path
+
+
+
 def parse_d701_line(line, station, host, timestamp=None, station_id="", zero_x_deg=0.0,
                     zero_y_deg=0.0, factor_x=DEG_TO_URAD, factor_y=DEG_TO_URAD):
     clean = line.strip()
@@ -113,7 +179,9 @@ def parse_d701_line(line, station, host, timestamp=None, station_id="", zero_x_d
 
 def new_sensor(station="STATION", host="192.168.1.10", port=4001):
     return {"id": uuid.uuid4().hex, "enabled": True, "station": station, "host": host, "port": port,
-            "zero_x_deg": 0.0, "zero_y_deg": 0.0, "factor_x": DEG_TO_URAD, "factor_y": DEG_TO_URAD}
+            "zero_x_deg": 0.0, "zero_y_deg": 0.0, "factor_x": DEG_TO_URAD, "factor_y": DEG_TO_URAD,
+            "metadata": default_metadata()}
+
 
 
 def default_config():
@@ -133,6 +201,7 @@ def normalize_config(source):
             sensor[key] = float(sensor.get(key, 0))
         for key in ("factor_x", "factor_y"):
             sensor[key] = float(sensor.get(key, DEG_TO_URAD))
+        sensor["metadata"] = normalize_metadata(old.get("metadata"))
         result["sensors"].append(sensor)
     return result
 
@@ -407,7 +476,274 @@ class SensorWorker(threading.Thread):
         self.save(self.aggregator.finish()); self.emit("status", "Berhenti")
 
 
+class MetadataWizard(tk.Toplevel):
+    PAGES = ("Stasiun", "Lokasi", "Perangkat", "Akuisisi", "Tinjau")
+    REQUIRED = ("code", "start_date", "location_type", "manufacturer", "model",
+                "serial_number", "output_unit", "logger_model", "timestamp_source", "time_sync")
+    SECTIONS = {
+        0: (("Identitas stasiun", (
+                ("_station", "Nama stasiun", "entry", ()),
+                ("code", "Kode", "entry", ()),
+                ("start_date", "Tanggal mulai (YYYY-MM-DD)", "entry", ()),
+                ("end_date", "Tanggal selesai (kosong = aktif)", "entry", ()),
+                ("location_type", "Jenis lokasi", "combo",
+                 ("Platform", "Borehole", "Vault", "Surface", "Tunnel", "Building", "Lainnya")),
+            )),),
+        1: (("Koordinat", (
+                ("latitude", "Latitude", "entry", ()),
+                ("longitude", "Longitude", "entry", ()),
+                ("elevation_m", "Elevasi (m)", "entry", ()),
+                ("datum", "Datum", "combo", ("WGS84", "DGN95", "Lokal")),
+                ("depth_m", "Kedalaman instalasi (m)", "entry", ()),
+            )),
+            ("Orientasi sensor", (
+                ("axis_x_azimuth_deg", "Azimuth sumbu X (derajat)", "entry", ()),
+                ("axis_y_azimuth_deg", "Azimuth sumbu Y (derajat)", "entry", ()),
+                ("orientation_reference", "Referensi orientasi", "combo",
+                 ("True north", "Magnetic north", "Grid north", "Lokal")),
+                ("positive_direction",
+                 "Arah positif (contoh: +X menuju puncak; +Y 90 derajat searah jarum jam)",
+                 "entry", ()),
+                ("location_notes", "Catatan lokasi", "entry", ()),
+            ))),
+        2: (("Sensor tiltmeter", (
+                ("manufacturer", "Merek", "entry", ()),
+                ("model", "Tipe / model", "entry", ()),
+                ("serial_number", "Serial number", "entry", ()),
+                ("firmware", "Firmware", "entry", ()),
+                ("output_unit", "Output unit", "combo",
+                 ("microradian", "milliradian", "degree", "arcsecond", "volt", "raw count")),
+            )),
+            ("Konfigurasi internal", (
+                ("n_samp", "N_SAMP", "entry", ()),
+                ("gain", "Gain", "entry", ()),
+                ("filter", "Filter", "entry", ()),
+            ))),
+        3: (("Data logger", (
+                ("logger_manufacturer", "Merek data logger", "entry", ()),
+                ("logger_model", "Model data logger", "entry", ()),
+                ("logger_serial_number", "Serial number data logger", "entry", ()),
+                ("logger_firmware", "Firmware data logger", "entry", ()),
+            )),
+            ("Timestamp dan sinkronisasi", (
+                ("timestamp_source", "Sumber timestamp", "combo",
+                 ("Sensor", "Data logger", "Komputer akuisisi", "Server")),
+                ("timezone", "Timezone data", "combo", ("UTC", "Asia/Jakarta", "Asia/Makassar", "Asia/Jayapura")),
+                ("time_sync", "Sinkronisasi waktu", "combo", ("NTP", "GPS", "PTP", "RTC internal", "Manual")),
+                ("time_server", "Server / sumber waktu", "entry", ()),
+                ("sync_interval", "Interval sinkronisasi", "entry", ()),
+                ("notes", "Catatan deployment", "entry", ()),
+            ))),
+    }
+
+    def __init__(self, parent, sensor):
+        super().__init__(parent)
+        self.parent, self.sensor, self.result, self.page = parent, sensor, None, 0
+        metadata = normalize_metadata(sensor.get("metadata"))
+        self.vars = {key: tk.StringVar(self, value=value) for key, value in metadata.items()}
+        self.vars["_station"] = tk.StringVar(self, value=sensor.get("station", ""))
+        self.title("Metadata Stasiun")
+        self.geometry("1040x720")
+        self.minsize(900, 620)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._build()
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+        self.wait_window(self)
+
+    def _build(self):
+        header = tk.Frame(self, bg="#F7FAFC", padx=24, pady=16)
+        header.pack(fill="x")
+        tk.Label(header, text="Metadata Stasiun", bg="#F7FAFC", fg="#102A43",
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="Lengkapi informasi instalasi secara bertahap",
+                 bg="#F7FAFC", fg="#627D98", font=("Segoe UI", 10)).pack(anchor="w")
+        self.steps = tk.Frame(self, bg="#F7FAFC", padx=20, pady=8)
+        self.steps.pack(fill="x")
+        self.step_labels = []
+        for index, name in enumerate(self.PAGES):
+            label = tk.Label(self.steps, text=f"{index + 1}  {name}", padx=12, pady=8,
+                             font=("Segoe UI", 9, "bold"), cursor="hand2")
+            label.pack(side="left", expand=True)
+            label.bind("<Button-1>", lambda _event, value=index: self.go_to(value))
+            self.step_labels.append(label)
+
+        content = ttk.Frame(self, padding=(20, 14))
+        content.pack(fill="both", expand=True)
+        self.page_frame = ttk.Frame(content)
+        self.page_frame.pack(side="left", fill="both", expand=True, padx=(0, 14))
+        summary = ttk.LabelFrame(content, text="Ringkasan", padding=16, width=250)
+        summary.pack(side="right", fill="y")
+        summary.pack_propagate(False)
+        self.summary_name = tk.StringVar()
+        self.summary_code = tk.StringVar()
+        self.summary_location = tk.StringVar()
+        self.summary_period = tk.StringVar()
+        self.summary_complete = tk.StringVar()
+        ttk.Label(summary, textvariable=self.summary_code, font=("Segoe UI", 15, "bold")).pack(anchor="w", pady=(4, 8))
+        ttk.Label(summary, textvariable=self.summary_name).pack(anchor="w", pady=4)
+        ttk.Label(summary, textvariable=self.summary_location).pack(anchor="w", pady=4)
+        ttk.Label(summary, textvariable=self.summary_period).pack(anchor="w", pady=4)
+        ttk.Separator(summary).pack(fill="x", pady=16)
+        ttk.Label(summary, textvariable=self.summary_complete, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(summary, text="Data teknis dapat dilengkapi\nsecara bertahap.",
+                  foreground="#627D98", justify="left").pack(anchor="w", pady=(12, 0))
+
+        footer = ttk.Frame(self, padding=(20, 12))
+        footer.pack(fill="x")
+        self.position_text = tk.StringVar()
+        ttk.Label(footer, textvariable=self.position_text).pack(side="left")
+        ttk.Button(footer, text="Batal", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(footer, text="Simpan draf", command=self.save_draft).pack(side="right", padx=8)
+        self.next_button = ttk.Button(footer, command=self.next_page)
+        self.next_button.pack(side="right", padx=8)
+        self.back_button = ttk.Button(footer, text="Kembali", command=self.previous_page)
+        self.back_button.pack(side="right")
+        for variable in self.vars.values():
+            variable.trace_add("write", lambda *_args: self.refresh_summary())
+        self.render_page()
+
+    def _field(self, parent, row, column, key, label, kind, values):
+        box = ttk.Frame(parent)
+        box.grid(row=row, column=column, sticky="ew", padx=7, pady=6)
+        ttk.Label(box, text=label).pack(anchor="w", pady=(0, 3))
+        if kind == "combo":
+            widget = ttk.Combobox(box, textvariable=self.vars[key], values=values, state="readonly")
+        else:
+            widget = ttk.Entry(box, textvariable=self.vars[key])
+        widget.pack(fill="x")
+        return widget
+
+    def render_page(self):
+        for child in self.page_frame.winfo_children():
+            child.destroy()
+        for index, label in enumerate(self.step_labels):
+            active = index == self.page
+            label.configure(bg="#0B74C9" if active else "#EAF2F8",
+                            fg="white" if active else "#486581")
+        self.position_text.set(f"Langkah {self.page + 1} dari {len(self.PAGES)}")
+        self.back_button.configure(state="normal" if self.page else "disabled")
+        self.next_button.configure(text="Simpan metadata" if self.page == 4
+                                   else f"Lanjut: {self.PAGES[self.page + 1]}  >")
+        if self.page == 4:
+            self._render_review()
+        else:
+            for section_title, fields in self.SECTIONS[self.page]:
+                group = ttk.LabelFrame(self.page_frame, text=section_title, padding=12)
+                group.pack(fill="x", pady=(0, 12))
+                group.columnconfigure(0, weight=1)
+                group.columnconfigure(1, weight=1)
+                for index, field in enumerate(fields):
+                    self._field(group, index // 2, index % 2, *field)
+        self.refresh_summary()
+
+    def _render_review(self):
+        ttk.Label(self.page_frame, text="Tinjau metadata", font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        ttk.Label(self.page_frame, text="Pastikan informasi utama sudah benar sebelum disimpan.",
+                  foreground="#627D98").pack(anchor="w", pady=(2, 14))
+        rows = (
+            ("Stasiun", self.vars["_station"].get()),
+            ("Kode / periode", f"{self.vars['code'].get()}  |  {self._period()}"),
+            ("Lokasi", self.vars["location_type"].get() or "Belum diisi"),
+            ("Koordinat", f"{self.vars['latitude'].get() or '-'}, {self.vars['longitude'].get() or '-'}"),
+            ("Sensor", " / ".join(filter(None, (self.vars["manufacturer"].get(),
+                                                  self.vars["model"].get(),
+                                                  self.vars["serial_number"].get()))) or "Belum diisi"),
+            ("Konfigurasi", f"N_SAMP {self.vars['n_samp'].get() or '-'} | "
+                            f"gain {self.vars['gain'].get() or '-'} | filter {self.vars['filter'].get() or '-'}"),
+            ("Data logger", " / ".join(filter(None, (self.vars["logger_manufacturer"].get(),
+                                                       self.vars["logger_model"].get()))) or "Belum diisi"),
+            ("Waktu", f"{self.vars['timestamp_source'].get() or '-'} | "
+                      f"{self.vars['time_sync'].get() or '-'} | {self.vars['timezone'].get() or '-'}"),
+        )
+        card = ttk.LabelFrame(self.page_frame, padding=14)
+        card.pack(fill="x")
+        for row, (label, value) in enumerate(rows):
+            ttk.Label(card, text=label, font=("Segoe UI", 9, "bold")).grid(
+                row=row, column=0, sticky="nw", padx=(0, 18), pady=6)
+            ttk.Label(card, text=value, wraplength=520).grid(row=row, column=1, sticky="nw", pady=6)
+        card.columnconfigure(1, weight=1)
+
+    def _period(self):
+        start = self.vars["start_date"].get().strip() or "belum diisi"
+        end = self.vars["end_date"].get().strip() or "sekarang"
+        return f"{start} - {end}"
+
+    def refresh_summary(self):
+        self.summary_name.set(self.vars["_station"].get().strip() or "Nama belum diisi")
+        self.summary_code.set(self.vars["code"].get().strip() or "DRAF")
+        self.summary_location.set(self.vars["location_type"].get().strip() or "Jenis lokasi belum diisi")
+        self.summary_period.set(self._period())
+        keys = [key for key in default_metadata() if key != "updated_at_utc"]
+        filled = sum(bool(self.vars[key].get().strip()) for key in keys) + bool(self.vars["_station"].get().strip())
+        self.summary_complete.set(f"Kelengkapan {round(filled / (len(keys) + 1) * 100)}%")
+
+    def validate_values(self, require_complete=False):
+        try:
+            for key in ("start_date", "end_date"):
+                value = self.vars[key].get().strip()
+                if value:
+                    datetime.strptime(value, "%Y-%m-%d")
+            start, end = self.vars["start_date"].get().strip(), self.vars["end_date"].get().strip()
+            if start and end and end < start:
+                raise ValueError("Tanggal selesai harus sama atau setelah tanggal mulai.")
+            for key, low, high, label in (
+                    ("latitude", -90, 90, "Latitude"), ("longitude", -180, 180, "Longitude"),
+                    ("axis_x_azimuth_deg", 0, 360, "Azimuth X"),
+                    ("axis_y_azimuth_deg", 0, 360, "Azimuth Y")):
+                value = self.vars[key].get().strip().replace(",", ".")
+                if value and not low <= float(value) <= high:
+                    raise ValueError(f"{label} harus antara {low} dan {high}.")
+            if not self.vars["_station"].get().strip():
+                raise ValueError("Nama stasiun wajib diisi.")
+            if require_complete:
+                missing = [key for key in self.REQUIRED if not self.vars[key].get().strip()]
+                if missing:
+                    labels = {"code": "kode", "start_date": "tanggal mulai",
+                              "location_type": "jenis lokasi", "manufacturer": "merek sensor",
+                              "model": "model sensor", "serial_number": "serial number sensor",
+                              "output_unit": "output unit", "logger_model": "model data logger",
+                              "timestamp_source": "sumber timestamp", "time_sync": "sinkronisasi waktu"}
+                    raise ValueError("Lengkapi field wajib: " + ", ".join(labels[key] for key in missing) + ".")
+            return True
+        except ValueError as exc:
+            messagebox.showerror("Metadata tidak valid", str(exc), parent=self)
+            return False
+
+    def go_to(self, page):
+        if self.validate_values(False):
+            self.page = page
+            self.render_page()
+
+    def previous_page(self):
+        if self.page:
+            self.page -= 1
+            self.render_page()
+
+    def next_page(self):
+        if not self.validate_values(self.page == 4):
+            return
+        if self.page == 4:
+            self._save()
+        else:
+            self.page += 1
+            self.render_page()
+
+    def save_draft(self):
+        if self.validate_values(False):
+            self._save()
+
+    def _save(self):
+        metadata = {key: variable.get().strip() for key, variable in self.vars.items() if key != "_station"}
+        metadata["updated_at_utc"] = iso_utc(utc_now())
+        self.result = {"station": self.vars["_station"].get().strip(), "metadata": metadata}
+        self.destroy()
+
+
 class SensorDialog(simpledialog.Dialog):
+
     def __init__(self, parent, title, sensor=None):
         self.sensor, self.result = (sensor or new_sensor()).copy(), None
         super().__init__(parent, title)
@@ -552,9 +888,10 @@ class MonitorApp(tk.Tk):
         graph_menu.add_command(label="Simpan grafik…", command=self.save_graph)
         menu.add_cascade(label="Grafik", menu=graph_menu)
         menu.add_command(label="Kalibrasi", command=self.calibrate)
+        menu.add_command(label="Metadata", command=self.edit_metadata)
         menu.add_command(label="Tentang", command=lambda: messagebox.showinfo(
-            "Tentang Tilty", "Tilty: Tiltmeter TCP Monitor\nOutput tilt: microradian.\n\n"
-            "Didesain dan dikembangkan oleh Sulistiyani\nsoelistiyani@gmail.com"))
+            "Tentang Tilty", f"Tilty: Tiltmeter TCP Monitor\nVersi: {APP_VERSION}\n\n"
+            "Oleh: Sulistiyani\nTahun: 2026"))
         self.configure(menu=menu)
         header = ttk.Frame(self, padding=(12, 8)); header.pack(fill="x")
         try:
@@ -577,6 +914,7 @@ class MonitorApp(tk.Tk):
         buttons = ttk.Frame(panel); buttons.pack(fill="x", pady=(8, 0))
         for label, cmd in (("Tambah", self.add_station), ("Edit", self.edit_station), ("Hapus", self.delete_station), ("Kalibrasi", self.calibrate)):
             ttk.Button(buttons, text=label, command=cmd).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Metadata", command=self.edit_metadata).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Mulai dipilih", command=self.start_selected).pack(side="left", padx=(18, 6))
         ttk.Button(buttons, text="Hentikan dipilih", command=self.stop_selected).pack(side="left", padx=(0, 6))
         self.start_button = ttk.Button(buttons, text="Mulai semua", command=self.start); self.start_button.pack(side="left", padx=(8, 6))
@@ -629,15 +967,45 @@ class MonitorApp(tk.Tk):
         return True
 
     def add_station(self):
-        if self.editable():
-            d = SensorDialog(self, "Tambah stasiun")
-            if d.result: self.config_data["sensors"].append(d.result); self.save_config(); self.refresh_table()
+        if not self.editable():
+            return
+        dialog = SensorDialog(self, "Tambah stasiun")
+        if not dialog.result:
+            return
+        sensor = dialog.result
+        self.config_data["sensors"].append(sensor)
+        self.save_config(); self.refresh_table()
+        self.tree.selection_set(sensor["id"])
+        self.open_metadata(sensor)
 
     def edit_station(self):
         sensor = self.selected()
         if self.editable() and sensor:
             d = SensorDialog(self, "Edit stasiun", sensor)
             if d.result: sensor.update(d.result); self.save_config(); self.refresh_table()
+
+    def open_metadata(self, sensor):
+        dialog = MetadataWizard(self, sensor)
+        if not dialog.result:
+            return
+        sensor.update(dialog.result)
+        self.save_config()
+        try:
+            current, history = write_metadata_snapshot(self.config_data["data_dir"], sensor)
+            self.graph_status.set(f"Metadata disimpan: {current}")
+        except OSError as exc:
+            messagebox.showwarning("Metadata tersimpan sebagian",
+                                   f"Konfigurasi tersimpan, tetapi file metadata gagal ditulis:\n{exc}",
+                                   parent=self)
+        self.refresh_table()
+
+    def edit_metadata(self):
+        sensor = self.selected()
+        if not sensor:
+            messagebox.showinfo("Metadata", "Pilih satu stasiun terlebih dahulu.")
+            return
+        if self.editable():
+            self.open_metadata(sensor)
 
     def delete_station(self):
         sensor = self.selected()
