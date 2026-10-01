@@ -8,6 +8,7 @@
 - Wizard metadata stasiun bertahap dengan validasi, ringkasan, dan penyimpanan draf.
 - Akuisisi dapat dimulai/dihentikan untuk stasiun yang dipilih atau semua stasiun sekaligus.
 - Reconnect otomatis per stasiun.
+- Watchdog tanpa data, TCP keepalive, panel aktivitas penerimaan, dan log diagnosis per stasiun.
 - Grafik real-time dan historis X, Y, dan temperatur.
 - Ringkasan status koneksi terkini serta status detail per stasiun.
 - Ekspor data historis stasiun ke CSV UTF-8.
@@ -91,7 +92,42 @@ Tilty otomatis memulai semua stasiun yang berstatus aktif saat aplikasi dibuka. 
 Jika NPort atau jaringan belum siap, worker akan mencoba terhubung kembali dengan jeda 2, 4, 8, 16, hingga maksimum 30 detik.
 ## Auto reconnect
 
-Reconnect selalu aktif dan independen untuk setiap stasiun. Jeda dimulai dari 2 detik, lalu 4, 8, 16, hingga maksimum 30 detik. Setelah koneksi berhasil, jeda kembali menjadi 2 detik.
+Monitoring data memakai waktu monotonic: peringatan setelah 30 detik tanpa byte dan reconnect setelah 120 detik tanpa byte. TCP keepalive diaktifkan. Byte yang terus masuk tanpa sampel valid memunculkan peringatan format/buffer tanpa reconnect otomatis.
+
+Panel diagnosis menampilkan waktu byte, baris lengkap, dan sampel valid terakhir (UTC), jumlah byte, baris rusak, ukuran buffer, reconnect, serta keadaan worker. Penghitung dimulai ulang saat worker baru dimulai. Log koneksi, kesehatan data, dan error disimpan di `NAMA_STASIUN/diagnostics/YYYY/YYYY-MM-DD_diagnostics.jsonl`.
+
+Batas dapat diatur per stasiun dalam konfigurasi aktif `%LOCALAPPDATA%\Tilty\config.json`: `data_warning_seconds` (30) dan `data_reconnect_seconds` (120). Tutup aplikasi sebelum mengedit. Harus 0 < peringatan < reconnect; sesuaikan dengan interval normal sensor. Reconnect tidak mengembalikan data yang sudah hilang.
+
+Contoh field tambahan pada objek stasiun dalam array `sensors`:
+
+```json
+"data_warning_seconds": 30,
+"data_reconnect_seconds": 120
+```
+
+Konfigurasi lama otomatis memakai batas default. Watchdog menggunakan waktu monotonic, sehingga perubahan jam komputer tidak mengubah perhitungan durasi tanpa byte. Jeda reconnect kembali ke 2 detik setelah sampel valid diterima; koneksi TCP yang berhasil dibuka tetapi tetap diam tidak mereset jeda.
+
+## Diagnosis data bolong
+
+Ping yang berhasil hanya menunjukkan NPort merespons jaringan pada saat pemeriksaan. Sensor, jalur serial, dan sesi TCP tetap perlu diperiksa. Klik stasiun untuk melihat panel diagnosis di bawah tabel.
+
+| Status atau indikator | Arti dan langkah pemeriksaan |
+| --- | --- |
+| TCP tersambung, menunggu data | Socket terbuka, tetapi sesi ini belum menerima sampel valid. |
+| TCP tersambung, tanpa byte | Tidak ada byte masuk melewati batas peringatan; watchdog akan reconnect ketika batas reconnect tercapai. Periksa aktivitas RX serial dan koneksi aktif NPort. |
+| Byte masuk, belum ada sampel valid | Periksa format payload, pemisah baris CR/LF, pengaturan serial, dan data packing NPort. |
+| Buffer bertambah, waktu baris tidak berubah | Byte masuk belum membentuk baris lengkap. Buffer melebihi 64 KiB dibuang dan dicatat sebagai error. |
+| Worker berhenti tidak terduga | Worker sudah tidak berjalan; periksa log diagnosis, lalu hentikan dan mulai kembali stasiun tersebut. |
+
+Waktu byte, baris, dan sampel valid terakhir ditampilkan dalam UTC. Nilai terakhir tetap terlihat ketika koneksi terputus; periksa status koneksi dan waktu tersebut bersama-sama. Jumlah reconnect mencatat gangguan yang memicu percobaan ulang, bukan jumlah koneksi ulang yang berhasil.
+
+Setiap baris log diagnosis adalah satu objek JSON dengan waktu UTC, identitas stasiun, endpoint, jenis kejadian, pesan, dan kondisi penerimaan. Jenis kejadian meliputi `connected`, `disconnected`, `data_health`, `error`, `worker_dead`, dan `stopped`. Log mencatat transisi kesehatan, bukan setiap paket; payload byte parsial tidak disimpan di log diagnosis. Jika penulisan log gagal, pesan ditampilkan di aplikasi.
+
+Raw log baru ditulis setelah menerima baris lengkap yang tidak kosong, sebelum parsing. Karena itu raw kosong belum membuktikan tidak ada byte masuk. Bandingkan waktu byte terakhir dengan waktu baris terakhir. Error akses raw/CSV dapat memicu reconnect; error SQLite dicatat sementara CSV tetap menjadi keluaran utama.
+
+Saat gangguan terjadi, catat waktu dan indikator diagnosis, periksa RX serial serta client aktif di NPort, lalu bila perlu capture trafik secara pasif dengan Wireshark. Hindari membuka client TCP tambahan sebelum memeriksa batas `Max connection`. Monitoring ini tidak melakukan ping otomatis atau mengubah konfigurasi NPort.
+
+Reconnect selalu aktif dan independen untuk setiap stasiun. Jeda dimulai dari 2 detik, lalu 4, 8, 16, hingga maksimum 30 detik. Setelah sampel valid diterima, jeda kembali menjadi 2 detik.
 
 ## Tentang
 

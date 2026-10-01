@@ -180,7 +180,8 @@ def parse_d701_line(line, station, host, timestamp=None, station_id="", zero_x_d
 def new_sensor(station="STATION", host="192.168.1.10", port=4001):
     return {"id": uuid.uuid4().hex, "enabled": True, "station": station, "host": host, "port": port,
             "zero_x_deg": 0.0, "zero_y_deg": 0.0, "factor_x": DEG_TO_URAD, "factor_y": DEG_TO_URAD,
-            "metadata": default_metadata()}
+            "metadata": default_metadata(), "data_warning_seconds": 30,
+            "data_reconnect_seconds": 120}
 
 
 
@@ -202,6 +203,11 @@ def normalize_config(source):
         for key in ("factor_x", "factor_y"):
             sensor[key] = float(sensor.get(key, DEG_TO_URAD))
         sensor["metadata"] = normalize_metadata(old.get("metadata"))
+        warning = float(sensor.get("data_warning_seconds", 30))
+        reconnect = float(sensor.get("data_reconnect_seconds", 120))
+        if not 0 < warning < reconnect or not math.isfinite(reconnect):
+            raise ValueError("Batas monitoring harus 0 < peringatan < reconnect")
+        sensor.update(data_warning_seconds=warning, data_reconnect_seconds=reconnect)
         result["sensors"].append(sensor)
     return result
 
@@ -423,8 +429,48 @@ class SensorWorker(threading.Thread):
         super().__init__(name=f"D701-{sensor['station']}", daemon=True)
         self.sensor, self.events, self.stop_event = sensor.copy(), events, stop_event
         self.writer, self.aggregator, self.sock = DataWriter(data_dir), MinuteAggregator(), None
+        self.health = dict(connected=False, last_byte=None, last_line=None, last_valid=None,
+                           bytes_received=0, invalid_lines=0, buffer_bytes=0, reconnects=0)
+        self.health_status = None
+        self.warning_seconds = float(sensor.get("data_warning_seconds", 30))
+        self.reconnect_seconds = float(sensor.get("data_reconnect_seconds", 120))
+        if not 0 < self.warning_seconds < self.reconnect_seconds or not math.isfinite(self.reconnect_seconds):
+            raise ValueError("Batas monitoring harus 0 < peringatan < reconnect")
+
+    def diagnose(self, event, message):
+        at = utc_now()
+        try:
+            folder = self.writer.root / safe_station_name(self.sensor["station"]) / "diagnostics" / at.strftime("%Y")
+            folder.mkdir(parents=True, exist_ok=True)
+            with (folder / f"{at:%Y-%m-%d}_diagnostics.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(dict(timestamp_utc=iso_utc(at), station_id=self.sensor["id"],
+                                             host=self.sensor["host"], port=self.sensor["port"],
+                                             event=event, message=str(message), **self.health), ensure_ascii=False) + "\n")
+        except OSError as exc:
+            self.events.put(("error", self.sensor["id"], f"Log diagnosis gagal: {exc}"))
+
+    def publish_health(self, buffer):
+        self.health["buffer_bytes"] = len(buffer)
+        self.emit("health", self.health.copy())
+
+    def check_health(self, now):
+        idle = now - self.byte_tick
+        valid_idle = now - self.valid_tick
+        if idle >= self.reconnect_seconds:
+            raise ConnectionError(f"watchdog: tidak ada byte selama {idle:.0f} dtk")
+        status = (f"TCP tersambung, tanpa byte {idle:.0f} dtk" if idle >= self.warning_seconds else
+                  "Byte masuk, belum ada sampel valid" if valid_idle >= self.warning_seconds else
+                  "Terhubung" if self.session_valid else "TCP tersambung, menunggu data")
+        # Log transitions once; durations are updated in the UI each second.
+        category = status.split(" selama")[0].split(" dtk")[0] if idle < self.warning_seconds else "tanpa byte"
+        if category != self.health_status:
+            self.health_status = category
+            self.diagnose("data_health", status)
+        self.emit("status", status)
 
     def emit(self, kind, payload=None):
+        if kind == "error":
+            self.diagnose("error", payload)
         self.events.put((kind, self.sensor["id"], payload))
 
     def close_socket(self):
@@ -447,12 +493,30 @@ class SensorWorker(threading.Thread):
             try:
                 self.emit("status", f"Menghubungkan {s['host']}:{s['port']}")
                 self.sock = socket.create_connection((s["host"], int(s["port"])), timeout=10)
-                self.sock.settimeout(1); self.emit("status", "Terhubung"); delay, buffer = 2, b""
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                try:
+                    if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+                        self.sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 10000))
+                except OSError as exc:
+                    self.emit("error", f"Pengaturan keepalive gagal: {exc}")
+                self.sock.settimeout(1)
+                buffer = b""
+                self.byte_tick = self.valid_tick = self.report_tick = time.monotonic()
+                self.session_valid = False
+                self.health["connected"] = True
+                self.health_status = None
+                self.diagnose("connected", "TCP tersambung")
+                self.check_health(self.byte_tick); self.publish_health(buffer)
                 while not self.stop_event.is_set():
                     try: chunk = self.sock.recv(4096)
                     except socket.timeout:
-                        self.save(self.aggregator.finish_if_due(utc_now())); continue
+                        self.save(self.aggregator.finish_if_due(utc_now()))
+                        self.check_health(time.monotonic()); self.publish_health(buffer)
+                        continue
                     if not chunk: raise ConnectionError("koneksi ditutup NPort")
+                    self.byte_tick = time.monotonic()
+                    self.health["last_byte"] = iso_utc(utc_now())
+                    self.health["bytes_received"] += len(chunk)
                     buffer += chunk
                     if len(buffer) > 65536:
                         buffer = b""; self.emit("error", "buffer melebihi 64 KiB")
@@ -462,18 +526,36 @@ class SensorWorker(threading.Thread):
                         buffer = buffer.lstrip(b"\r\n")
                         if not raw.strip(): continue
                         at, line = utc_now(), raw.decode("ascii", errors="replace").strip()
+                        self.health["last_line"] = iso_utc(at)
                         self.writer.write_raw(s["station"], s["host"], at, line)
                         reading = parse_d701_line(line, s["station"], s["host"], at, s["id"],
                                                  s["zero_x_deg"], s["zero_y_deg"], s["factor_x"], s["factor_y"])
                         if reading:
+                            self.valid_tick = time.monotonic(); self.session_valid = True; delay = 2
+                            self.health["last_valid"] = iso_utc(at)
                             self.save(self.aggregator.add(reading)); self.emit("reading", reading)
-                        else: self.emit("error", f"format salah: {line[:60]}")
+                        else:
+                            self.health["invalid_lines"] += 1
+                            self.emit("error", f"format salah: {line[:60]}")
+                    now = time.monotonic()
+                    if now - self.report_tick >= 1:
+                        self.check_health(now); self.publish_health(buffer); self.report_tick = now
             except (OSError, ConnectionError) as exc:
+                self.health["connected"] = False
+                self.health["reconnects"] += int(not self.stop_event.is_set())
+                self.publish_health(buffer if "buffer" in locals() else b"")
+                self.diagnose("disconnected", exc)
                 if not self.stop_event.is_set():
                     self.emit("status", f"Terputus: {exc}; ulang {delay} dtk")
-                    self.stop_event.wait(delay); delay = min(delay*2, 30)
             finally: self.close_socket()
-        self.save(self.aggregator.finish()); self.emit("status", "Berhenti")
+            if not self.stop_event.is_set():
+                self.stop_event.wait(delay); delay = min(delay*2, 30)
+        try:
+            self.save(self.aggregator.finish())
+        except OSError as exc:
+            self.emit("error", f"Penyimpanan akhir gagal: {exc}")
+        self.health["connected"] = False; self.publish_health(b"")
+        self.diagnose("stopped", "Akuisisi dihentikan"); self.emit("status", "Berhenti")
 
 
 class MetadataWizard(tk.Toplevel):
@@ -855,6 +937,7 @@ class MonitorApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.events, self.workers = queue.Queue(), {}
         self.config_data = self.load_config(); self.status = {}; self.latest = {}; self.counts = {}; self.history = {}
+        self.health = {}
         self.historical = {}; self.history_request = 0; self.save_period = None
         self.build_ui(); self.refresh_table(); self.after(100, self.process_events); self.after(1000, self.refresh_plot)
         self.after(1200, self.check_time_setting)
@@ -910,7 +993,12 @@ class MonitorApp(tk.Tk):
                                      (55, 140, 165, 220, 410, 65)):
             self.tree.heading(key, text=label); self.tree.column(key, width=width, anchor="w")
         self.tree.pack(fill="x"); self.tree.bind("<Double-1>", lambda _e: self.edit_station())
+        scroll = ttk.Scrollbar(panel, orient="horizontal", command=self.tree.xview)
+        scroll.pack(fill="x"); self.tree.configure(xscrollcommand=scroll.set)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.load_selected_history())
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_diagnostics(), add="+")
+        self.diagnostic_text = tk.StringVar(value="Pilih stasiun untuk melihat aktivitas data (UTC).")
+        ttk.Label(panel, textvariable=self.diagnostic_text, wraplength=1100).pack(fill="x", pady=4)
         buttons = ttk.Frame(panel); buttons.pack(fill="x", pady=(8, 0))
         for label, cmd in (("Tambah", self.add_station), ("Edit", self.edit_station), ("Hapus", self.delete_station), ("Kalibrasi", self.calibrate)):
             ttk.Button(buttons, text=label, command=cmd).pack(side="left", padx=(0, 6))
@@ -953,10 +1041,27 @@ class MonitorApp(tk.Tk):
         children = self.tree.get_children()
         if children: self.tree.selection_set(selected[0] if selected and selected[0] in children else children[0])
         self.update_connection_summary()
+        self.update_diagnostics()
+
+    def update_diagnostics(self):
+        sensor = self.selected()
+        if not sensor: return
+        sid = sensor["id"]
+        h = self.health.get(sid, {})
+        entry = self.workers.get(sid)
+        alive = bool(entry and entry[0].is_alive())
+        self.diagnostic_text.set(
+            f"{sensor['station']} | Worker: {'berjalan' if alive else 'berhenti'} | "
+            f"Byte terakhir: {h.get('last_byte') or '-'} | Baris: {h.get('last_line') or '-'} | "
+            f"Valid: {h.get('last_valid') or '-'} (UTC)\n"
+            f"Byte diterima: {h.get('bytes_received', 0)} | Baris rusak: {h.get('invalid_lines', 0)} | "
+            f"Buffer: {h.get('buffer_bytes', 0)} byte | Reconnect: {h.get('reconnects', 0)}")
 
     def update_connection_summary(self):
-        connected = sum(self.status.get(s["id"]) == "Terhubung" for s in self.config_data["sensors"])
-        connecting = sum(s["id"] in self.workers and self.status.get(s["id"]) != "Terhubung"
+        connected_ids = {s["id"] for s in self.config_data["sensors"]
+                         if self.health.get(s["id"], {}).get("connected", self.status.get(s["id"]) == "Terhubung")}
+        connected = len(connected_ids)
+        connecting = sum(s["id"] in self.workers and self.workers[s["id"]][0].is_alive() and s["id"] not in connected_ids
                          for s in self.config_data["sensors"])
         stopped = len(self.config_data["sensors"]) - connected - connecting
         self.connection_status.set(
@@ -1100,7 +1205,8 @@ class MonitorApp(tk.Tk):
         try:
             while True:
                 kind, sid, payload = self.events.get_nowait(); dirty = True
-                if kind in ("status", "error"): self.status[sid] = payload
+                if kind == "health": self.health[sid] = payload
+                elif kind in ("status", "error"): self.status[sid] = payload
                 elif kind == "history":
                     request_id, label, rows = payload
                     if request_id == self.history_request:
@@ -1127,6 +1233,13 @@ class MonitorApp(tk.Tk):
                     self.counts[sid] = self.counts.get(sid, 0) + 1
                     self.latest[sid] = f"X={payload.x:.2f} µrad, Y={payload.y:.2f} µrad, T={payload.temperature:.2f} °C"
         except queue.Empty: pass
+        for sid, (worker, stop_event) in self.workers.items():
+            if not worker.is_alive() and not stop_event.is_set():
+                message = "Worker berhenti tidak terduga; mulai ulang stasiun"
+                if self.status.get(sid) != message:
+                    self.status[sid] = message; dirty = True
+                    worker.diagnose("worker_dead", message)
+                    self.health.setdefault(sid, {})["connected"] = False
         if dirty: self.refresh_table()
         self.after(100, self.process_events)
 

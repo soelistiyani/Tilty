@@ -9,6 +9,54 @@ from d701_monitor import (DataWriter, MinuteAggregator, TimeSettingsRecorder,
                           query_export_rows, query_history)
 
 class TestD701Monitor(unittest.TestCase):
+    def test_watchdog_silent_connection_and_diagnostics(self):
+        import queue
+        import socket
+        import threading
+        from unittest.mock import patch
+        from d701_monitor import SensorWorker, new_sensor
+        with tempfile.TemporaryDirectory() as temp:
+            events = queue.Queue(); stop = threading.Event()
+            sensor = new_sensor("TEST", "127.0.0.1")
+            sensor.update(data_warning_seconds=1, data_reconnect_seconds=2)
+            worker = SensorWorker(sensor, temp, events, stop)
+            class SilentSocket:
+                def setsockopt(self, *args): pass
+                def ioctl(self, *args): pass
+                def settimeout(self, *args): pass
+                def recv(self, *args): raise socket.timeout()
+                def shutdown(self, *args): pass
+                def close(self): pass
+            def finish_wait(delay):
+                if worker.health["reconnects"] >= 2:
+                    stop.set(); return True
+                return False
+            with patch("d701_monitor.socket.create_connection", return_value=SilentSocket()) as connect, \
+                 patch("d701_monitor.time.monotonic", side_effect=[0, 1, 2, 3, 4, 5]), \
+                 patch.object(stop, "wait", side_effect=finish_wait):
+                worker.run()
+            self.assertEqual(connect.call_count, 2)
+            self.assertEqual(worker.health["reconnects"], 2)
+            records = list(events.queue)
+            self.assertTrue(any("tanpa byte" in str(r[2]) for r in records))
+            self.assertTrue(any("watchdog" in str(r[2]) for r in records))
+            self.assertFalse(worker.health["connected"])
+            logs = list(Path(temp).rglob("*_diagnostics.jsonl"))
+            self.assertEqual(len(logs), 1)
+            self.assertIn("watchdog", logs[0].read_text(encoding="utf-8"))
+
+    def test_incoming_bytes_without_valid_samples_do_not_reconnect(self):
+        import queue
+        import threading
+        from d701_monitor import SensorWorker, new_sensor
+        with tempfile.TemporaryDirectory() as temp:
+            worker = SensorWorker(new_sensor(), temp, queue.Queue(), threading.Event())
+            worker.byte_tick = 119; worker.valid_tick = 0; worker.session_valid = False
+            worker.check_health(120)
+            self.assertIn("belum ada sampel valid", list(worker.events.queue)[-1][2])
+            worker.publish_health(b"partial")
+            self.assertEqual(worker.health["buffer_bytes"], 7)
+
     def test_application_version(self):
         from d701_monitor import APP_VERSION
         self.assertEqual(APP_VERSION, "1.7.0")
